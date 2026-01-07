@@ -45,6 +45,9 @@ class inpParser3:
             
             # Parse each section based on its type
             self._parse_section(section_name, section_content)
+        
+        # After parsing all sections, extract network connectivity
+        self.extract_connectivity()
     
     def _parse_section(self, section_name, content):
         """Route section to appropriate parser based on its structure"""
@@ -235,10 +238,15 @@ class inpParser3:
             self.data['Transient_Data'] = transient_data
     
     def _parse_table_section(self, section_name, content):
-        """Parse table sections (Type B - columnar data)"""
+        """Parse table sections (Type B - columnar data) with multi-part headers"""
         lines = [l.strip() for l in content.split('\n') if l.strip()]
         
         if not lines:
+            return
+        
+        # Special handling for sections with multiple data blocks
+        if any(keyword in section_name for keyword in ['Control Valve', 'Assigned Pressure']):
+            self._parse_multi_block_table(section_name, content, lines)
             return
         
         # Find header row(s)
@@ -323,6 +331,343 @@ class inpParser3:
             self.data[clean_name] = df
             self.units[clean_name] = units_dict
     
+    def _parse_multi_block_table(self, section_name, content, lines):
+        """Parse tables with multiple data blocks separated by header rows"""
+        blocks = []
+        current_block_headers = []
+        current_block_data = []
+        current_block_name = None
+        in_data = False
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            
+            # Check if this is a header line
+            is_header = (re.search(r'[A-Za-z]', line) and 
+                        not line[0].isdigit() and 
+                        not line.startswith('('))
+            
+            if is_header:
+                # Save previous block if it exists
+                if current_block_data and current_block_headers:
+                    blocks.append({
+                        'name': current_block_name,
+                        'headers': current_block_headers,
+                        'data': current_block_data
+                    })
+                
+                # Start new block
+                current_block_name = line.split()[0] if not current_block_name else current_block_name
+                current_block_headers.append(line)
+                current_block_data = []
+                in_data = False
+            else:
+                # This is a data line
+                parts = line.split()
+                if parts and parts[0].replace('.', '').replace('-', '').isdigit():
+                    current_block_data.append(parts)
+                    in_data = True
+            
+            i += 1
+        
+        # Save last block
+        if current_block_data and current_block_headers:
+            blocks.append({
+                'name': current_block_name,
+                'headers': current_block_headers,
+                'data': current_block_data
+            })
+        
+        # Process each block and create combined DataFrame
+        all_data = []
+        all_headers = set()
+        
+        for block in blocks:
+            # Parse headers for this block
+            headers = self._parse_block_headers(block['headers'])
+            all_headers.update(headers)
+            
+            # Create DataFrame for this block
+            block_df = pd.DataFrame(block['data'])
+            
+            # Ensure correct number of columns
+            if len(block_df.columns) > len(headers):
+                headers.extend([f'Col_{i}' for i in range(len(headers), len(block_df.columns))])
+            elif len(block_df.columns) < len(headers):
+                headers = headers[:len(block_df.columns)]
+            
+            block_df.columns = headers
+            
+            # Convert numeric columns
+            for col in block_df.columns:
+                try:
+                    block_df[col] = pd.to_numeric(block_df[col])
+                except (ValueError, TypeError):
+                    pass
+            
+            all_data.append(block_df)
+        
+        # Combine all blocks
+        if all_data:
+            # Concatenate dataframes horizontally, handling duplicate columns
+            combined_df = all_data[0]
+            id_col = combined_df.columns[0]
+            
+            for block_idx, df in enumerate(all_data[1:], start=1):
+                df_id_col = df.columns[0]
+                
+                # Rename columns in the new df to avoid duplicates (except ID column)
+                new_cols = {}
+                for col in df.columns:
+                    if col == df_id_col:
+                        continue  # Skip ID column
+                    # Check if column already exists
+                    if col in combined_df.columns:
+                        # Add suffix to make it unique
+                        new_cols[col] = f"{col}_block{block_idx}"
+                    else:
+                        new_cols[col] = col
+                
+                df_renamed = df.rename(columns=new_cols)
+                
+                # Merge
+                combined_df = combined_df.merge(
+                    df_renamed, 
+                    left_on=id_col, 
+                    right_on=df_id_col, 
+                    how='outer', 
+                    suffixes=('', f'_b{block_idx}')
+                )
+                
+                # Remove duplicate ID columns if they exist
+                dup_cols = [c for c in combined_df.columns if c.endswith(f'_b{block_idx}') and c.replace(f'_b{block_idx}', '') == id_col]
+                if dup_cols:
+                    combined_df = combined_df.drop(columns=dup_cols)
+            
+            # Clean section name for storage
+            clean_name = section_name.replace(' ', '_').replace('*', '').strip()
+            self.data[clean_name] = combined_df
+    
+    def _parse_block_headers(self, header_lines):
+        """Parse headers from a block, handling multi-row headers with units"""
+        headers = []
+        
+        if not header_lines:
+            return headers
+        
+        # Join all header lines to handle wrapped headers
+        full_header_text = ' '.join(header_lines)
+        
+        # Try to extract structured column names
+        # Pattern for complex headers like "(Pipe #1) K In, K Out"
+        pipe_pattern = r'\(Pipe #(\d+)\)\s+([\w\s,]+)'
+        pipe_matches = re.findall(pipe_pattern, full_header_text)
+        
+        if pipe_matches:
+            # This is the Assigned Pressure table with pipe columns
+            # Start with basic columns
+            basic_headers = header_lines[0].split()
+            
+            # Filter out pipe-related text from basic headers
+            filtered_basic = []
+            skip_next = False
+            for i, h in enumerate(basic_headers):
+                if '(Pipe' in h or skip_next:
+                    skip_next = ')' not in h
+                    continue
+                filtered_basic.append(h)
+            
+            headers.extend(filtered_basic)
+            
+            # Add pipe columns
+            for pipe_num, pipe_cols in pipe_matches:
+                cols = [c.strip() for c in pipe_cols.split(',')]
+                for col in cols:
+                    headers.append(f"Pipe_{pipe_num}_{col.replace(' ', '_')}")
+            
+            return headers
+        
+        # Standard multi-row header parsing
+        all_parts = []
+        for line in header_lines:
+            all_parts.append(line.split())
+        
+        # Find the line with most parts (main header)
+        main_header_idx = 0
+        max_parts = 0
+        for idx, parts in enumerate(all_parts):
+            if len(parts) > max_parts:
+                max_parts = len(parts)
+                main_header_idx = idx
+        
+        main_headers = all_parts[main_header_idx]
+        
+        # Look for units line
+        units_line = None
+        for line in header_lines:
+            if 'Units' in line or 'units' in line:
+                units_line = line.split()
+                break
+        
+        # Build headers with units
+        for i, header in enumerate(main_headers):
+            if units_line and i < len(units_line):
+                unit = units_line[i]
+                if unit.lower() not in ['units', 'unit']:
+                    # Check if unit looks like a unit (lowercase, common units)
+                    if unit in ['feet', 'inches', 'psia', 'psig', 'barrels/day', 'gpm', 'N/A']:
+                        if unit != 'N/A':
+                            headers.append(f"{header} ({unit})")
+                        else:
+                            headers.append(header)
+                    else:
+                        headers.append(header)
+                else:
+                    headers.append(header)
+            else:
+                headers.append(header)
+        
+        return headers
+    
+    def pipeNames(self):
+        """Extract names of all pipes in the network"""
+        pipe_summary = self.data.get('Pipe_Detail_Summary')
+        if pipe_summary is not None and 'Name' in pipe_summary.columns:
+            return pd.Series(pipe_summary['Name'].values, index=pipe_summary.index, name='Pipe_Name')
+        return pd.Series(dtype=str)
+    
+    def pipeDiameter(self):
+        """Extract diameter of each pipe"""
+        pipe_summary = self.data.get('Pipe_Detail_Summary')
+        if pipe_summary is not None:
+            diameter_col = [col for col in pipe_summary.columns if 'Diameter' in col]
+            if diameter_col:
+                return pd.Series(pipe_summary[diameter_col[0]].values, index=pipe_summary.index, name='Diameter')
+        return pd.Series(dtype=float)
+    
+    def pipeTotal_Length(self):
+        """Extract total length of each pipe"""
+        pipe_summary = self.data.get('Pipe_Detail_Summary')
+        if pipe_summary is not None:
+            length_col = [col for col in pipe_summary.columns if 'Length' in col]
+            if length_col:
+                return pd.Series(pipe_summary[length_col[0]].values, index=pipe_summary.index, name='Length')
+        return pd.Series(dtype=float)
+    
+    def pipeRoughness(self):
+        """Extract roughness coefficient of each pipe"""
+        pipe_summary = self.data.get('Pipe_Detail_Summary')
+        if pipe_summary is not None:
+            roughness_col = [col for col in pipe_summary.columns if 'Roughness' in col]
+            if roughness_col:
+                return pd.Series(pipe_summary[roughness_col[0]].values, index=pipe_summary.index, name='Roughness')
+        return pd.Series(dtype=float)
+    
+    def pipeLen_Elev(self):
+        """Extract length vs elevation data for pipes from Pipe Elevations section"""
+        return self.data.get('Pipe_Elevations_Summary', pd.DataFrame())
+    
+    def getPumps(self):
+        """Extract pump names and properties"""
+        return self.data.get('Pump_Table', pd.DataFrame())
+    
+    def getJunctions(self):
+        """Extract junction names"""
+        return self.data.get('Branch_Table', pd.DataFrame())
+    
+    def getReservoirs(self):
+        """Extract reservoir names and pressures"""
+        return self.data.get('Assigned_Pressure_Table', pd.DataFrame())
+    
+    def getValves(self):
+        """Extract control valve names and flowrates"""
+        valve_table = self.data.get('Valve_Table', pd.DataFrame())
+        control_valve_table = self.data.get('Control_Valve_Table', pd.DataFrame())
+        
+        if not valve_table.empty:
+            return valve_table
+        elif not control_valve_table.empty:
+            return control_valve_table
+        return pd.DataFrame()
+    
+    def extract_connectivity(self):
+        """
+        Parses the 'Branch Table' to deduce Pipe Connectivity.
+        Returns a DataFrame with 'Pipe_ID', 'Upstream_Junction', 'Downstream_Junction' columns.
+        """
+        # 1. Get the raw text of the Branch Table section
+        branch_section = self.sections.get('Branch Table')
+        if not branch_section:
+            print("Warning: No 'Branch Table' section found.")
+            return pd.DataFrame()
+        
+        # 2. Initialize the Dictionary
+        pipe_connections = {}
+        
+        # 3. Define Regex to find pipe entries
+        pipe_pattern = re.compile(r'\(P(\d+)\)')
+        
+        # 4. Iterate through each line of the Branch Table
+        lines = branch_section.split('\n')
+        for line in lines:
+            line = line.strip()
+            
+            # Skip headers and empty lines
+            if not line or not line[0].isdigit():
+                continue
+            
+            # The first token is the Branch (Junction) ID
+            parts = line.split()
+            if not parts:
+                continue
+                
+            junction_id = parts[0]
+            
+            # Find all pipes listed in this row
+            matches = pipe_pattern.findall(line)
+            
+            for pipe_id in matches:
+                # Standardize Pipe ID format
+                pipe_key = f"Pipe_{pipe_id}"
+                
+                # If this is the first time seeing this pipe, create a new list
+                if pipe_key not in pipe_connections:
+                    pipe_connections[pipe_key] = []
+                
+                # Add this junction to the pipe's list
+                pipe_connections[pipe_key].append(junction_id)
+        
+        # 5. Convert Dictionary to DataFrame
+        connectivity_rows = []
+        for pipe_id, junctions in pipe_connections.items():
+            row = {'Pipe_ID': pipe_id}
+            
+            # A valid pipe connects to at least 1 junction (dead end) or 2 (normal)
+            if len(junctions) > 0:
+                row['Upstream_Junction'] = junctions[0]
+            else:
+                row['Upstream_Junction'] = None
+                
+            if len(junctions) > 1:
+                row['Downstream_Junction'] = junctions[1]
+            else:
+                row['Downstream_Junction'] = None
+            
+            # Handle unusual cases (3+ connections)
+            if len(junctions) > 2:
+                row['Notes'] = f"Connected to {len(junctions)} junctions: {','.join(junctions)}"
+            else:
+                row['Notes'] = None
+                
+            connectivity_rows.append(row)
+        
+        df_conn = pd.DataFrame(connectivity_rows)
+        
+        # Save to data dictionary
+        self.data['Network_Connectivity'] = df_conn
+        return df_conn
+    
     def get_section(self, section_name):
         """Get parsed data for a specific section"""
         return self.data.get(section_name)
@@ -349,17 +694,44 @@ class inpParser3:
             return transient.get(equipment_id)
         return transient
     
+    def get_network_connectivity(self):
+        """Get network connectivity DataFrame showing pipe connections to junctions"""
+        return self.data.get('Network_Connectivity')
+    
     def list_sections(self):
         """List all available sections"""
         return list(self.data.keys())
     
-    def export_to_excel(self, output_path=None, include_detailed_segments=True):
-        """Export all parsed data to Excel file
+    def extract_all(self):
+        """Extract all pipe and equipment data into a comprehensive dataset"""
+        # Pipe data
+        pipe_data = pd.DataFrame({
+            'Pipe_Name': self.pipeNames(),
+            'Diameter': self.pipeDiameter(),
+            'Length': self.pipeTotal_Length(),
+            'Roughness': self.pipeRoughness()
+        })
         
-        Args:
-            output_path: Path for output Excel file (optional)
-            include_detailed_segments: If True, export detailed segment data for pipes
-        """
+        # Add elevation data
+        len_elev = self.pipeLen_Elev()
+        if not len_elev.empty:
+            pipe_data = pipe_data.join(len_elev[['Start Elevation (feet)', 'End Elevation (feet)', 'Elevation Change (feet)']])
+        
+        # Extract network connectivity (already done in _parse_all_sections)
+        connectivity = self.get_network_connectivity()
+        
+        # Equipment data
+        equipment_data = {
+            'Pumps': self.getPumps(),
+            'Junctions': self.getJunctions(),
+            'Reservoirs': self.getReservoirs(),
+            'Valves': self.getValves()
+        }
+        
+        return pipe_data, equipment_data
+    
+    def export_to_excel(self, output_path=None, include_detailed_segments=True):
+        """Export all parsed data to Excel file"""
         if output_path is None:
             base_name = os.path.splitext(self.filepath)[0]
             output_path = f"{base_name}_parsed.xlsx"
