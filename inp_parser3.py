@@ -5,6 +5,7 @@ import re
 
 
 class inpParser3:
+
     """Advanced parser for EPANET .inp files using regex to extract pipe and equipment attributes"""
     
     def __init__(self, filepath):
@@ -14,6 +15,7 @@ class inpParser3:
         self.sections = {}
         self.data = {}
         self.units = {}
+        self.node_map = {}
         self._parse_all_sections()
     
     def read_file(self, file_path):
@@ -47,6 +49,7 @@ class inpParser3:
             self._parse_section(section_name, section_content)
         
         # After parsing all sections, extract network connectivity
+        self._build_master_node_map()
         self.extract_connectivity()
     
     def _parse_section(self, section_name, content):
@@ -530,6 +533,65 @@ class inpParser3:
         
         return headers
     
+    def _build_master_node_map(self):
+        """
+        Scans all component tables to create a dictionary mapping Node IDs to descriptive names.
+        Example: Map ID '30' -> 'Junction 30 (J 84)' or 'Source 6 (Sullivan)'
+        """
+        # Map Section Headers to readable Component Types
+        type_map = {
+            'Branch Table': 'Junction',
+            'Assigned Pressure Table': 'Boundary',
+            'Assigned Flow Table': 'Source',
+            'Valve Table': 'Valve',
+            'Control Valve Table': 'Control Valve',
+            'Reservoir Table': 'Reservoir',
+            'Check Valve Table': 'Check Valve',
+            'Relief Valve Table': 'Relief Valve',
+            'Surge Tank Table': 'Surge Tank',
+            'Pump Table': 'Pump'
+        }
+
+        for section_key, content in self.sections.items():
+            # Find the component type based on the section name
+            comp_type = next((v for k, v in type_map.items() if k in section_key), None)
+            if not comp_type:
+                continue
+
+            lines = content.split('\n')
+            for line in lines:
+                line = line.strip()
+                # Skip headers and empty lines. Data lines start with a digit.
+                if not line or not line[0].isdigit():
+                    continue
+                
+                parts = line.split()
+                if len(parts) >= 2:
+                    node_id = parts[0]
+                    
+                    # --- FIX: Prevent Overwriting ---
+                    # The Definition table (with the Name) is always the first block in the section.
+                    # Subsequent blocks list attributes (like "No", "(P17)", etc.).
+                    # If we have already named this node, skip it to avoid overwriting with garbage.
+                    if node_id in self.node_map:
+                        continue
+
+                    # Logic: In AFT, Name is often the 2nd column.
+                    # If the Name is "J" (common for Junctions), check if parts[2] is a number (e.g. "J 84")
+                    raw_name = parts[1]
+                    
+                    # Special handling for names with spaces (like "J 84") 
+                    # If part[1] is 'J' and part[2] is a number, combine them.
+                    if len(parts) > 2 and parts[1] == 'J' and parts[2].isdigit():
+                         raw_name = f"J {parts[2]}"
+                    # Special handling for Multi-Word names (e.g., "Wiedeman Federal")
+                    # If there is a 3rd part and it's NOT "Yes"/"No" or a number, append it.
+                    elif len(parts) > 2 and parts[2] not in ['Yes', 'No'] and not parts[2].replace('.','').isdigit():
+                         raw_name = f"{parts[1]} {parts[2]}"
+                    
+                    # Store in map
+                    self.node_map[node_id] = f"{comp_type} {node_id} ({raw_name})"
+
     def pipeNames(self):
         """Extract names of all pipes in the network"""
         pipe_summary = self.data.get('Pipe_Detail_Summary')
@@ -593,114 +655,83 @@ class inpParser3:
     
     def extract_connectivity(self):
         """
-        Parses the 'Branch Table' to deduce Pipe Connectivity.
-        Returns a DataFrame with 'Pipe_ID', 'Upstream_Junction', 'Downstream_Junction' columns.
+        Extracts pipe connections prioritizing the 'Junctions (Up,Down)' table column.
         """
-        # 1. Get the raw text of the Branch Table section
-        branch_section = self.sections.get('Branch Table')
-        if not branch_section:
-            print("Warning: No 'Branch Table' section found.")
-            return pd.DataFrame()
+        connections = []
+        target_section = None
         
-        # 2. Initialize the Dictionary
-        pipe_connections = {}
+        # --- Strategy 1: Find the Table with "Junctions (Up,Down)" (High Accuracy) ---
+        for name, content in self.sections.items():
+            if "Junctions" in content and "Up,Down" in content:
+                target_section = content
+                break
         
-        # 3. Define Regex to find pipe entries
-        pipe_pattern = re.compile(r'\(P(\d+)\)')
-        
-        # 4. Iterate through each line of the Branch Table
-        lines = branch_section.split('\n')
-        for line in lines:
-            line = line.strip()
+        if target_section:
+            lines = target_section.split('\n')
+            # Regex to find: PipeID ... UpNode, DownNode
+            # Matches lines like: "17   30, 280"
+            pattern = re.compile(r'^\s*(\d+)\s+.*?(\d+)\s*,\s*(\d+)')
             
-            # Skip headers and empty lines
-            if not line or not line[0].isdigit():
-                continue
-            
-            # The first token is the Branch (Junction) ID
-            parts = line.split()
-            if not parts:
-                continue
+            for line in lines:
+                match = pattern.search(line)
+                if match:
+                    pipe_id = match.group(1)
+                    up_id = match.group(2)
+                    down_id = match.group(3)
+                    
+                    # Use the Master Node Map to get friendly names
+                    up_name = self.node_map.get(up_id, f"Node {up_id}")
+                    down_name = self.node_map.get(down_id, f"Node {down_id}")
+                    
+                    connections.append({
+                        'Name': f"Pipe_{pipe_id}",
+                        'Upstream Node': up_name,
+                        'Downstream Node': down_name,
+                        'Notes': ''
+                    })
+        
+        # --- Strategy 2: Fallback (Scan component tables) ---
+        if not connections:
+            pipe_pattern = re.compile(r'\(P(\d+)\)')
+            pipe_raw_links = {}
+
+            # Reuse the type map logic to scan tables
+            for section_key, content in self.sections.items():
+                if "Table" not in section_key: continue
                 
-            junction_id = parts[0]
+                lines = content.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if not line or not line[0].isdigit(): continue
+                    
+                    parts = line.split()
+                    node_id = parts[0]
+                    node_label = self.node_map.get(node_id, f"Node {node_id}")
+                    
+                    found_pipes = pipe_pattern.findall(line)
+                    for pid in found_pipes:
+                        pkey = f"Pipe_{pid}"
+                        if pkey not in pipe_raw_links: pipe_raw_links[pkey] = []
+                        if node_label not in pipe_raw_links[pkey]:
+                            pipe_raw_links[pkey].append(node_label)
             
-            # Find all pipes listed in this row
-            matches = pipe_pattern.findall(line)
-            
-            for pipe_id in matches:
-                # Standardize Pipe ID format
-                pipe_key = f"Pipe_{pipe_id}"
+            # Format fallback connections
+            for pkey, nodes in pipe_raw_links.items():
+                row = {'Name': pkey}
+                if len(nodes) > 0: row['Upstream Node'] = nodes[0]
+                else: row['Upstream Node'] = "Unknown"
                 
-                # If this is the first time seeing this pipe, create a new list
-                if pipe_key not in pipe_connections:
-                    pipe_connections[pipe_key] = []
+                if len(nodes) > 1: row['Downstream Node'] = nodes[1]
+                else: row['Downstream Node'] = "Boundary/Open"
                 
-                # Add this junction to the pipe's list
-                pipe_connections[pipe_key].append(junction_id)
-        
-        # 5. Convert Dictionary to DataFrame
-        connectivity_rows = []
-        for pipe_id, junctions in pipe_connections.items():
-            row = {'Pipe_ID': pipe_id}
-            
-            # A valid pipe connects to at least 1 junction (dead end) or 2 (normal)
-            if len(junctions) > 0:
-                row['Upstream_Junction'] = junctions[0]
-            else:
-                row['Upstream_Junction'] = None
-                
-            if len(junctions) > 1:
-                row['Downstream_Junction'] = junctions[1]
-            else:
-                row['Downstream_Junction'] = None
-            
-            # Handle unusual cases (3+ connections)
-            if len(junctions) > 2:
-                row['Notes'] = f"Connected to {len(junctions)} junctions: {','.join(junctions)}"
-            else:
-                row['Notes'] = None
-                
-            connectivity_rows.append(row)
-        
-        df_conn = pd.DataFrame(connectivity_rows)
-        
-        # Save to data dictionary
-        self.data['Network_Connectivity'] = df_conn
-        return df_conn
-    
-    def get_section(self, section_name):
-        """Get parsed data for a specific section"""
-        return self.data.get(section_name)
-    
-    def get_pipe_detail_summary(self):
-        """Get pipe detail summary DataFrame"""
-        return self.data.get('Pipe_Detail_Summary')
-    
-    def get_pipe_elevations_summary(self):
-        """Get pipe elevations summary DataFrame"""
-        return self.data.get('Pipe_Elevations_Summary')
-    
-    def get_pipe_elevations_detailed(self, pipe_id=None):
-        """Get detailed pipe elevation segments"""
-        detailed = self.data.get('Pipe_Elevations_Detailed', {})
-        if pipe_id:
-            return detailed.get(pipe_id)
-        return detailed
-    
-    def get_transient_data(self, equipment_id=None):
-        """Get transient data for equipment"""
-        transient = self.data.get('Transient_Data', {})
-        if equipment_id:
-            return transient.get(equipment_id)
-        return transient
+                row['Notes'] = "Inferred from Components"
+                connections.append(row)
+
+        self.data['Network_Connectivity'] = pd.DataFrame(connections)
     
     def get_network_connectivity(self):
         """Get network connectivity DataFrame showing pipe connections to junctions"""
         return self.data.get('Network_Connectivity')
-    
-    def list_sections(self):
-        """List all available sections"""
-        return list(self.data.keys())
     
     def extract_all(self):
         """Extract all pipe and equipment data into a comprehensive dataset"""
@@ -737,51 +768,89 @@ class inpParser3:
             output_path = f"{base_name}_parsed.xlsx"
         
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # Export main sections
-            for section_name, df in self.data.items():
+
+            #  Connectivity first
+            if 'Network_Connectivity' in self.data:
+                self.data['Network_Connectivity'].to_excel(
+                    writer, sheet_name='Network_Connectivity', index=False
+                )
+
+            # Core tables
+            for section, df in self.data.items():
+                if section in ['Network_Connectivity', 'Pipe_Elevations_Detailed', 'Transient_Data']:
+                    continue
+
                 if isinstance(df, pd.DataFrame) and not df.empty:
-                    # Clean sheet name (Excel 31 char limit, no special chars)
-                    sheet_name = section_name[:31].replace('/', '_').replace('\\', '_')
-                    df.to_excel(writer, sheet_name=sheet_name, index=True)
-                
-                elif isinstance(df, dict):
-                    # Handle nested data (like transient data, detailed elevations)
-                    if section_name == 'Pipe_Elevations_Detailed' and include_detailed_segments:
-                        for pipe_id, pipe_df in df.items():
-                            if isinstance(pipe_df, pd.DataFrame) and not pipe_df.empty:
-                                sheet_name = f"Elev_{pipe_id}"[:31].replace('/', '_').replace('\\', '_')
-                                pipe_df.to_excel(writer, sheet_name=sheet_name, index=True)
-                    
-                    elif section_name == 'Transient_Data':
-                        for equipment_id, equip_df in df.items():
-                            if isinstance(equip_df, pd.DataFrame) and not equip_df.empty:
-                                sheet_name = f"Trans_{equipment_id}"[:31].replace('/', '_').replace('\\', '_')
-                                equip_df.to_excel(writer, sheet_name=sheet_name, index=True)
-        
+                    sheet = section[:31]
+                    df.to_excel(writer, sheet_name=sheet, index=True)
+
+            # Detailed segments LAST
+            if include_detailed_segments:
+                elev = self.data.get('Pipe_Elevations_Detailed', {})
+                for pipe, df in elev.items():
+                    df.to_excel(writer, sheet_name=f"Elev_{pipe}"[:31], index=False)
+
+                trans = self.data.get('Transient_Data', {})
+                for eq, df in trans.items():
+                    df.to_excel(writer, sheet_name=f"Trans_{eq}"[:31], index=False)
+
         print(f"✓ Data successfully exported to: {output_path}")
         print(f"✓ Exported {len([d for d in self.data.values() if isinstance(d, pd.DataFrame)])} main sections")
         return output_path
-    
-    def summary(self):
-        """Print summary of parsed data"""
-        print("\n" + "="*60)
-        print("INP PARSER SUMMARY")
-        print("="*60)
-        print(f"File: {os.path.basename(self.filepath)}")
-        print(f"\nSections found: {len(self.sections)}")
-        print(f"Sections parsed: {len(self.data)}")
-        print("\nAvailable data:")
-        for section_name, data in self.data.items():
-            if isinstance(data, pd.DataFrame):
-                print(f"  • {section_name}: {len(data)} rows")
-            elif isinstance(data, dict):
-                print(f"  • {section_name}: {len(data)} items")
-        print("="*60 + "\n")
 
+    # --- GUI MAIN EXECUTION ---
 
-# Example usage
+# GUI implementation
 if __name__ == "__main__":
-    parser = inpParser3("Sample.inp")
-    parser.summary()
-    parser.export_to_excel(include_detailed_segments=False)
-    pass
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+    import os
+
+    # 1. Hide the main tkinter window (we only want the pop-ups)
+    root = tk.Tk()
+    root.withdraw()
+
+    # 2. Ask user to select the INP file
+   
+    inp_path = filedialog.askopenfilename(
+        title="Select your AFT Impulse .inp file",
+        filetypes=[("AFT Input Files", "*.inp"), ("All Files", "*.*")]
+    )
+
+    # Check if they clicked Cancel
+    if not inp_path:
+        print("No file selected. Exiting.")
+        exit()
+
+    # 3. Ask user where to save the Excel file
+    default_save = os.path.splitext(inp_path)[0] + "_parsed.xlsx"
+    save_path = filedialog.asksaveasfilename(
+        title="Save Excel Report As...",
+        defaultextension=".xlsx",
+        initialfile=os.path.basename(default_save),
+        filetypes=[("Excel Files", "*.xlsx")]
+    )
+
+    if not save_path:
+        print("No save location selected. Exiting.")
+        exit()
+
+    # 4. Run the Process
+    try:
+        
+        parser = inpParser3(inp_path)
+        parser.extract_connectivity()
+        parser.export_to_excel(output_path=save_path, include_detailed_segments=True)
+        
+        # 5. Success Popup
+        messagebox.showinfo(
+            title="Success", 
+            message=f"Extraction Complete!\n\nSaved to:\n{save_path}"
+        )
+        
+    except Exception as e:
+        # Error Popup
+        messagebox.showerror(
+            title="Error", 
+            message=f"An error occurred during extraction:\n\n{str(e)}"
+        )
